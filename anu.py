@@ -1,13 +1,13 @@
 import base64
 import json
+import os
 import random
 import re
 import secrets
+import subprocess
 import sys
 import time
-import urllib.error
 import urllib.parse
-import urllib.request
 import uuid
 from datetime import datetime
 import sys
@@ -29,6 +29,61 @@ DEADLINE_SECS = 60.0
 ATTEMPTS = 2
 PAUSE_BETWEEN = 3.0
 READ_TIMEOUT = 20
+CONNECT_TIMEOUT = 6
+
+# ------------------------------------------------------- proxy pool (proxiech)
+# alive_proxies.txt is written by proxiech.py - verified exits for i.instagram.com.
+PROXY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "alive_proxies.txt")
+PROXY_SPIN = 3            # extra proxies burned through when one fails at network level
+_proxy_pool = None
+_proxy_idx = 0
+
+
+def _ensure_deps():
+    """requests + pysocks (for socks4/socks5 exits) - auto-installed once."""
+    try:
+        import requests          # noqa: F401
+        import socks             # noqa: F401
+    except ImportError:
+        print("[setup] installing requests + pysocks ...", flush=True)
+        subprocess.check_call(
+            [sys.executable, "-m", "pip", "install", "--quiet", "requests", "pysocks"]
+        )
+        import requests          # noqa: F401
+        import socks             # noqa: F401
+    return __import__("requests")
+
+
+requests = _ensure_deps()
+
+
+def load_proxies():
+    """alive_proxies.txt -> list of proxy URLs (cached, comments skipped)."""
+    global _proxy_pool
+    if _proxy_pool is not None:
+        return _proxy_pool
+    pool = []
+    try:
+        with open(PROXY_FILE, encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    pool.append(line)
+    except OSError:
+        pass
+    _proxy_pool = pool
+    return pool
+
+
+def next_proxy():
+    """Round-robin over the alive pool. None = no pool -> direct IP fallback."""
+    global _proxy_idx
+    pool = load_proxies()
+    if not pool:
+        return None
+    proxy = pool[_proxy_idx % len(pool)]
+    _proxy_idx += 1
+    return proxy
 
 def build_request(email):
     device = "android-" + "".join(random.choices("abcdef0123456789", k=16))
@@ -108,17 +163,21 @@ def build_request(email):
     return payload, headers
 
 
-def send_request(payload, headers):
+def send_request(payload, headers, proxy=None):
+    """POST through the given proxy (None = direct). Every request goes out
+    via the alive_proxies.txt pool when it exists."""
     body = urllib.parse.urlencode(payload).encode("utf-8")
-    req = urllib.request.Request(URL, data=body, headers=headers, method="POST")
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    s = requests.Session()
+    s.trust_env = False              # ignore system/env proxy settings
     try:
-        with opener.open(req, timeout=READ_TIMEOUT) as resp:
-            return resp.status, resp.read().decode("utf-8", "replace")
-    except urllib.error.HTTPError as e:
-        return e.code, e.read().decode("utf-8", "replace")
+        proxies = {"http": proxy, "https": proxy} if proxy else None
+        resp = s.post(URL, data=body, headers=headers, proxies=proxies,
+                      timeout=(CONNECT_TIMEOUT, READ_TIMEOUT))
+        return resp.status_code, resp.text
     except Exception as e:
         return 0, f"{type(e).__name__}: {e}"
+    finally:
+        s.close()
 
 
 def classify(email, status_code, body):
@@ -165,12 +224,23 @@ def run_recovery(email):
     last, detail = "ig_error", "-"
     for i in range(1, ATTEMPTS + 1):
         payload, headers = build_request(email)
+        proxy = next_proxy()
         try:
-            status_code, body = send_request(payload, headers)
+            status_code, body = send_request(payload, headers, proxy)
+            # network-level failure = this exit is garbage -> burn through a
+            # few more proxies right now (until the deadline)
+            spin = 0
+            while (status_code == 0 and proxy and spin < PROXY_SPIN
+                   and time.time() < deadline):
+                proxy = next_proxy()
+                status_code, body = send_request(payload, headers, proxy)
+                spin += 1
             last, detail = classify(email, status_code, body)
         except Exception as e:
             last, detail = "ig_error", type(e).__name__
-        print(f"   attempt {i}/{ATTEMPTS}: {last} ({detail})", flush=True)
+        via = proxy.rsplit("//", 1)[-1] if proxy else "direct"
+        print(f"   attempt {i}/{ATTEMPTS}: {last} ({detail})  via {via}",
+              flush=True)
         if last != "ig_error":
             return last
         if time.time() > deadline:
@@ -183,12 +253,16 @@ def run_recovery(email):
 def main():
     email = ask_email(sys.argv[1:])
 
+    pool = load_proxies()
+    mode = (f"proxy pool ({len(pool)} alive exits)" if pool
+            else "direct IP (alive_proxies.txt missing/empty - pehle py proxiech.py chalao)")
+
     print("=" * 58)
     print(" INSTAGRAM RESET LINK SENDER")
     print(f" target: {email}")
+    print(f" route : {mode}")
     print("=" * 58)
-    print("\n [1/1] Running the account-recovery flow (direct IP)...",
-          flush=True)
+    print("\n [1/1] Running the account-recovery flow...", flush=True)
 
     t0 = time.time()
     try:

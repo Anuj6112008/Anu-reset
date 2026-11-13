@@ -6,6 +6,14 @@ import logging
 import re
 import asyncio
 import json
+import base64
+import random
+import secrets
+import subprocess
+import threading
+import urllib.parse
+import uuid
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.error import BadRequest, TimedOut, NetworkError, RetryAfter
@@ -42,8 +50,9 @@ CHANNELS = [
     ADM_DEL_CODE_INPUT
 ) = range(13)
 
-# High concurrency: 25 scripts can run in parallel without hanging Termux
-CONCURRENCY_LIMIT = asyncio.Semaphore(25)
+# High concurrency: 25 resets can run in parallel without hanging Termux
+MAX_PARALLEL_RESES = 25
+CONCURRENCY_LIMIT = asyncio.Semaphore(MAX_PARALLEL_RESES)
 
 # ========== HIGH-SPEED IN-MEMORY DATABASE WITH LOCK ==========
 DB_FILE = "users_db.json"
@@ -1107,17 +1116,344 @@ async def process_redeem(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await show_modes(update, context, "<b>What would you like to do next?</b>")
     return CHOOSING_MODE
 
-# ========== NON-BLOCKING PARALLEL SCRIPT EXECUTION ==========
-async def run_anu_script(email: str) -> bool:
-    async with CONCURRENCY_LIMIT: 
+# ========== INSTAGRAM RECOVERY ENGINE (merged from anu.py - single file) ==========
+# Tokenless bloks POST to i.instagram.com. Every request round-robins through
+# alive_proxies.txt (written by proxiech.py) - never a bare direct-IP call
+# while the pool has exits.
+URL = ("https://i.instagram.com/api/v1/bloks/async_action/"
+       "com.bloks.www.caa.ar.search.async/")
+BLOKS_VERSION = ("5e47baf35c5a270b44c8906c8b99063564b30ef69779f3dee0b828bee2e4ef5b")
+APP_USER_AGENT = ("Instagram 320.0.0.34.109 Android (33/13; 420dpi; "
+                  "1080x2340; samsung; SM-A546B; a54x; exynos1380; "
+                  "en_US; 465123678)")
+
+DEADLINE_SECS = 60.0
+ATTEMPTS = 2
+PAUSE_BETWEEN = 3.0
+READ_TIMEOUT = 20
+CONNECT_TIMEOUT = 6
+PROXY_SPIN = 3            # extra proxies burned through when one fails at network level
+ENGINE_VERBOSE = False    # True = print attempt lines (kept False for clean bot terminal)
+
+BOT_DIR = os.path.dirname(os.path.abspath(__file__))
+PROXY_FILE = os.path.join(BOT_DIR, "alive_proxies.txt")
+
+PROXY_TARGET = 100        # keep this many verified exits saved
+PROXY_REFILL_AT = 10      # runtime refill kicks in below this
+REFILL_COOLDOWN = 120     # min seconds between refill hunts
+_proxy_pool = None
+_proxy_idx = 0
+_pool_lock = threading.Lock()
+_refill_task = None       # asyncio.Task running the current refill hunt
+_last_refill_end = 0.0
+
+
+def _ensure_deps():
+    """requests + pysocks (for socks4/socks5 exits) - auto-installed once."""
+    try:
+        import requests          # noqa: F401
+        import socks             # noqa: F401
+    except ImportError:
+        print("[setup] installing requests + pysocks ...", flush=True)
+        subprocess.check_call(
+            [sys.executable, "-m", "pip", "install", "--quiet", "requests", "pysocks"]
+        )
+        import requests          # noqa: F401
+        import socks             # noqa: F401
+    return __import__("requests")
+
+
+requests = _ensure_deps()
+
+
+def load_proxies():
+    """alive_proxies.txt -> list of proxy URLs (cached, comments skipped)."""
+    global _proxy_pool
+    if _proxy_pool is not None:
+        return _proxy_pool
+    pool = []
+    try:
+        with open(PROXY_FILE, encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    pool.append(line)
+    except OSError:
+        pass
+    _proxy_pool = pool
+    return pool
+
+
+def next_proxy():
+    """Round-robin over the alive pool. None = no pool -> direct IP fallback."""
+    global _proxy_idx
+    pool = load_proxies()
+    with _pool_lock:
+        n = len(pool)
+        if n == 0:
+            return None
+        proxy = pool[_proxy_idx % n]
+        _proxy_idx += 1
+        return proxy
+
+
+def retire_proxy(proxy):
+    """Drop a proven-dead exit from the in-memory pool (file stays untouched
+    - only proxiech.py writes alive_proxies.txt)."""
+    global _proxy_pool
+    if not proxy:
+        return
+    with _pool_lock:
+        if _proxy_pool and proxy in _proxy_pool:
+            try:
+                _proxy_pool.remove(proxy)
+            except ValueError:
+                pass
+
+
+def reload_proxies():
+    """Re-read alive_proxies.txt (after a refill hunt) and reset rotation."""
+    global _proxy_pool, _proxy_idx
+    with _pool_lock:
+        _proxy_pool = None
+        _proxy_idx = 0
+    return load_proxies()
+
+
+def build_request(email):
+    device = "android-" + "".join(random.choices("abcdef0123456789", k=16))
+    family = str(uuid.uuid4())
+    android = "android-" + "".join(random.choices("abcdef0123456789", k=16))
+    waterfall = str(uuid.uuid4())
+
+    params = (
+        "{\"client_input_params\":{\"aac\":\"{\\\"aac_init_timestamp\\\":"
+        + str(int(time.time()))
+        + ",\\\"aacjid\\\":\\\"" + str(uuid.uuid4())
+        + "\\\",\\\"aaccs\\\":\\\"" + secrets.token_urlsafe(32)
+        + "\\\"}\",\"flash_call_permissions_status\":{\"READ_PHONE_STATE\":"
+          "\"PERMANENTLY_DENIED\",\"READ_CALL_LOG\":\"DENIED\","
+          "\"ANSWER_PHONE_CALLS\":\"DENIED\"},\"was_headers_prefill_available\":0,"
+          "\"network_bssid\":null,\"sfdid\":\"\",\"fetched_email_token_list\":{},"
+          "\"search_query\":\""
+        + email
+        + "\",\"auth_secure_device_id\":\"\",\"ig_oauth_token\":[],"
+          "\"cloud_trust_token\":null,\"was_headers_prefill_used\":0,"
+          "\"sso_accounts_auth_data\":[],\"encrypted_msisdn\":\"\","
+          "\"device_network_info\":null,\"text_input_id\":\"akyuf0:61\","
+          "\"zero_balance_state\":null,\"android_build_type\":\"release\","
+          "\"accounts_list\":[],\"is_oauth_without_permission\":0,"
+          "\"ig_android_qe_device_id\":\""
+        + device
+        + "\",\"gms_incoming_call_retriever_eligibility\":\"client_not_supported\","
+          "\"search_screen_type\":\"email_or_username\",\"is_whatsapp_installed\":1,"
+          "\"lois_settings\":{\"lois_token\":\"\"},\"ig_vetted_device_nonce\":null,"
+          "\"headers_infra_flow_id\":\"\",\"fetched_email_list\":[]},"
+          "\"server_params\":{\"event_request_id\":\""
+        + str(uuid.uuid4())
+        + "\",\"is_from_logged_out\":0,\"layered_homepage_experiment_group\":null,"
+          "\"device_id\":\""
+        + android
+        + "\",\"login_surface\":\"login_home\",\"waterfall_id\":\""
+        + waterfall
+        + "\",\"INTERNAL__latency_qpl_instance_id\":6.3987980400102E13,"
+          "\"is_platform_login\":0,\"context_data\":\"\","
+          "\"login_entry_point\":\"logged_out\","
+          "\"INTERNAL__latency_qpl_marker_id\":36707139,\"family_device_id\":\""
+        + family
+        + "\",\"offline_experiment_group\":\"caa_iteration_v3_perf_ig_4\","
+          "\"access_flow_version\":\"pre_mt_behavior\","
+          "\"is_from_logged_in_switcher\":0,\"qe_device_id\":\""
+        + device + "\"}}"
+    )
+
+    payload = {
+        "params": params,
+        "bk_client_context": ("{\"bloks_version\":\"" + BLOKS_VERSION
+                              + "\",\"styles_id\":\"instagram\"}"),
+        "bloks_versioning_id": BLOKS_VERSION,
+    }
+
+    headers = {
+        "User-Agent": APP_USER_AGENT,
+        "accept-language": "en-IN, en-US",
+        "x-bloks-version-id": BLOKS_VERSION,
+        "x-fb-friendly-name": ("IgApi: bloks/async_action/"
+                               "com.bloks.www.caa.ar.search.async/"),
+        "x-ig-android-id": android,
+        "x-ig-app-id": "567067343352427",
+        "x-ig-app-locale": "en_IN",
+        "x-ig-client-endpoint": "com.bloks.www.caa.ar.search",
+        "x-ig-device-id": device,
+        "x-ig-family-device-id": family,
+        "x-ig-timezone-offset": str(int(datetime.now().astimezone()
+                                        .utcoffset().total_seconds())),
+        "x-mid": base64.urlsafe_b64encode(secrets.token_bytes(18))
+                    .decode().rstrip("="),
+        "x-pigeon-rawclienttime": str(time.time()),
+        "x-pigeon-session-id": f"UFS-{uuid.uuid4()}-0",
+        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+        "Accept": "*/*",
+    }
+    return payload, headers
+
+
+def send_request(payload, headers, proxy=None):
+    """POST through the given proxy (None = direct). Every request goes out
+    via the alive_proxies.txt pool when it exists."""
+    body = urllib.parse.urlencode(payload).encode("utf-8")
+    s = requests.Session()
+    s.trust_env = False              # ignore system/env proxy settings
+    try:
+        proxies = {"http": proxy, "https": proxy} if proxy else None
+        resp = s.post(URL, data=body, headers=headers, proxies=proxies,
+                      timeout=(CONNECT_TIMEOUT, READ_TIMEOUT))
+        return resp.status_code, resp.text
+    except Exception as e:
+        return 0, f"{type(e).__name__}: {e}"
+    finally:
+        s.close()
+
+
+def classify(email, status_code, body):
+    if status_code == 429:
+        return "ig_error", "http_429"
+    if status_code != 200:
+        return "ig_error", f"http_{status_code}"
+    try:
+        data = json.loads(body)
+    except Exception:
+        return "ig_error", "non_json"
+    if data.get("status") != "ok":
+        return "ig_error", f"status_{data.get('status')}"
+
+    low = body.lower()
+    echoed = email.lower() in low
+    has_screen = "embedded_payloads" in body
+    size = len(body)
+
+    if has_screen and size > 100000:
+        return "ig_connected", f"len={size}"
+    if (not echoed) and (not has_screen) and size < 100000:
+        return "ig_not_connected", f"len={size}"
+    return "ig_error", f"unexpected len={size}"
+
+
+def run_recovery(email):
+    deadline = time.time() + DEADLINE_SECS
+    last, detail = "ig_error", "-"
+    for i in range(1, ATTEMPTS + 1):
+        payload, headers = build_request(email)
+        proxy = next_proxy()
         try:
-            process = await asyncio.create_subprocess_exec(
-                sys.executable, "anu.py", email,
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL
+            status_code, body = send_request(payload, headers, proxy)
+            # network-level failure = this exit is dead -> retire it from the
+            # pool and burn through a few more (until the deadline)
+            spin = 0
+            while status_code == 0 and proxy and time.time() < deadline:
+                retire_proxy(proxy)
+                if spin >= PROXY_SPIN:
+                    break
+                nxt = next_proxy()
+                if nxt is None:
+                    proxy = None          # pool drained - refill is on the way
+                    break
+                proxy = nxt
+                status_code, body = send_request(payload, headers, proxy)
+                spin += 1
+            last, detail = classify(email, status_code, body)
+        except Exception as e:
+            last, detail = "ig_error", type(e).__name__
+        if ENGINE_VERBOSE:
+            via = proxy.rsplit("//", 1)[-1] if proxy else "direct"
+            print(f"   attempt {i}/{ATTEMPTS}: {last} ({detail})  via {via}",
+                  flush=True)
+        if last != "ig_error":
+            return last
+        if time.time() > deadline:
+            break
+        if i < ATTEMPTS:
+            time.sleep(PAUSE_BETWEEN)
+    return last
+
+
+def send_reset_link(email: str) -> bool:
+    """Blocking engine entry point - True only when Instagram really sent
+    the reset link (same semantics as anu.py's old exit code 0)."""
+    try:
+        return run_recovery(email) == "ig_connected"
+    except Exception:
+        return False
+
+
+# ========== NON-BLOCKING PARALLEL RESET EXECUTION (in-process) ==========
+# Old design: spawned `python anu.py <email>` as a subprocess per reset.
+# The merged engine above now runs inside this worker pool instead - no
+# second file to ship, event loop never blocks, 25 parallel like before.
+ENGINE_POOL = ThreadPoolExecutor(max_workers=MAX_PARALLEL_RESES,
+                                 thread_name_prefix="igreset")
+
+
+# ---------- automatic refill: pool low -> proxiech.py runs in background ----
+def _refill_active() -> bool:
+    return _refill_task is not None and not _refill_task.done()
+
+
+async def refill_proxies():
+    """Hunt with proxiech.py until PROXY_TARGET alive exits are saved, then
+    swap the fresh list into memory. Background task - never blocks the bot."""
+    global _last_refill_end
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable, os.path.join(BOT_DIR, "proxiech.py"),
+            "--target", str(PROXY_TARGET),
+            "--workers", "70",
+            "--deadline", "900",
+            cwd=BOT_DIR,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        await proc.wait()
+    except Exception:
+        pass
+    finally:
+        reload_proxies()
+        _last_refill_end = time.time()
+
+
+async def ensure_proxies(min_want=PROXY_REFILL_AT) -> bool:
+    """Start a background refill when the pool dropped below min_want.
+    Single-flight + cooldown; returns immediately (never blocks)."""
+    global _refill_task
+    if _refill_active():
+        return False
+    if len(load_proxies()) >= min_want:
+        return False
+    if time.time() - _last_refill_end < REFILL_COOLDOWN:
+        return False
+    _refill_task = asyncio.create_task(refill_proxies())
+    return True
+
+
+async def run_reset_flow(email: str) -> bool:
+    """Run the Instagram recovery engine off-loop. True = link sent."""
+    await ensure_proxies() # pool low? refill starts in background now
+    if not load_proxies() and _refill_active():
+        # pool drained while the refill hunt is running - wait a little so
+        # the request still leaves through a proxy (never a bare direct call)
+        try:
+            await asyncio.wait_for(asyncio.shield(_refill_task), timeout=45)
+        except Exception:
+            pass
+        if not load_proxies() and _refill_active():
+            return False              # still hunting - skip, points auto-refund
+    async with CONCURRENCY_LIMIT:
+        try:
+            loop = asyncio.get_running_loop()
+            return await asyncio.wait_for(
+                loop.run_in_executor(ENGINE_POOL, send_reset_link, email),
+                timeout=25.0,
             )
-            await asyncio.wait_for(process.wait(), timeout=25.0)
-            return process.returncode == 0
         except Exception:
             return False
 
@@ -1143,7 +1479,7 @@ async def process_single(update: Update, context: ContextTypes.DEFAULT_TYPE):
     update_user_stats(user_id, -1)
     status_msg = await update.message.reply_text(f"⏳ <b>Processing reset link for:</b> {email}...", parse_mode="HTML")
     
-    success = await run_anu_script(email)
+    success = await run_reset_flow(email)
     
     if success:
         update_user_stats(user_id, 0, success=True)
@@ -1189,7 +1525,7 @@ async def process_multi(update: Update, context: ContextTypes.DEFAULT_TYPE):
     success_count, failed_count = 0, 0
 
     for email in valid_emails:
-        if await run_anu_script(email):
+        if await run_reset_flow(email):
             success_count += 1
             update_user_stats(user_id, 0, success=True)
         else:
@@ -1211,6 +1547,14 @@ async def process_multi(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return CHOOSING_MODE
 
 # ========== MAIN LOOP (100+ CONCURRENT USERS READY) ==========
+async def on_post_init(app: Application):
+    """Top the IG proxy pool up to PROXY_TARGET in the background."""
+    try:
+        await ensure_proxies(PROXY_TARGET)
+    except Exception:
+        pass
+
+
 def main():
     load_db()
     t_request = HTTPXRequest(
@@ -1226,6 +1570,7 @@ def main():
         .token(BOT_TOKEN)
         .request(t_request)
         .concurrent_updates(True)
+        .post_init(on_post_init)
         .build()
     )
 
@@ -1270,7 +1615,11 @@ def main():
     )
 
     app.add_handler(conv_handler)
-    print("🤖 Bot Running (High-Concurrency 100+ Users Mode, Zero Logs)!")
+    ig_pool = load_proxies()
+    ig_route = (f"{len(ig_pool)} proxy exits (alive_proxies.txt)" if ig_pool
+                else "DIRECT - proxiech se pehle alive_proxies.txt banao")
+    print(f"🤖 Bot Running (High-Concurrency 100+ Users Mode, Zero Logs)!")
+    print(f"   IG route: {ig_route}")
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
